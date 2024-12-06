@@ -1,0 +1,4 @@
+HYPERPARAM:
+  lr: 1e-4
+  lr_backbone:1e-5
+  
