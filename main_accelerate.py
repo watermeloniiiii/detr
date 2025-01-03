@@ -11,7 +11,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 import wandb
-import OmegaConf
+from omegaconf import OmegaConf
+
+from accelerate import DistributedDataParallelKwargs
+from accelerate import Accelerator
+
 import datasets
 import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
@@ -178,8 +182,13 @@ def get_args_parser():
 
 
 def main(args):
-    utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator = Accelerator(
+        kwargs_handlers=[ddp_kwargs],
+        log_with="wandb",
+        gradient_accumulation_steps=1,
+        project_dir=os.path.join(args.PATH.model_dir, args.PROJECT.model_name),
+    )
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
@@ -192,25 +201,9 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    if torch.distributed.get_rank() == 0:
-        wandb.login(key="c10829f6b79edeea79554d3c1660588729eec616")
-        # wandb.login()
-        config_wandb = {}
-        wandb.require("core")
-        wandb.init(
-            entity="chenxilin",
-            config=config_wandb,
-            project=f"object detection",
-            name=args.model_name,
-        )
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
-
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of params:", n_parameters)
 
@@ -218,14 +211,14 @@ def main(args):
         {
             "params": [
                 p
-                for n, p in model_without_ddp.named_parameters()
+                for n, p in model.named_parameters()
                 if "backbone" not in n and p.requires_grad
             ]
         },
         {
             "params": [
                 p
-                for n, p in model_without_ddp.named_parameters()
+                for n, p in model.named_parameters()
                 if "backbone" in n and p.requires_grad
             ],
             "lr": args.lr_backbone,
@@ -239,27 +232,14 @@ def main(args):
     dataset_train = build_dataset(image_set="train", args=args)
     dataset_val = build_dataset(image_set="val", args=args)
 
-    if args.distributed:
-        sampler_train = DistributedSampler(dataset_train)
-        sampler_val = DistributedSampler(dataset_val, shuffle=False)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True
-    )
-
     data_loader_train = DataLoader(
         dataset_train,
-        batch_sampler=batch_sampler_train,
         collate_fn=utils.collate_fn,
         num_workers=args.num_workers,
     )
     data_loader_val = DataLoader(
         dataset_val,
         args.batch_size,
-        sampler=sampler_val,
         drop_last=False,
         collate_fn=utils.collate_fn,
         num_workers=args.num_workers,
@@ -272,9 +252,32 @@ def main(args):
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
 
+    accelerator.init_trackers(
+            project_name=f"DINOv2_downstreams",
+            init_kwargs={
+                "wandb": {
+                    "entity": "chenxilin",
+                    "name": args.PROJECT.model_name,
+                }
+            },
+        )
+        (
+            model
+            optimizer,
+            data_loader_train,
+            self.scheduler,
+            data_loader_val,
+        ) = accelerator.prepare(
+            self.net,
+            self.optimizer,
+            self.train_loader,
+            self.scheduler,
+            self.vali_loader,
+        )    
+
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location="cpu")
-        model_without_ddp.detr.load_state_dict(checkpoint["model"])
+        model.detr.load_state_dict(checkpoint["model"])
 
     output_dir = Path(args.output_dir)
     if args.resume:
@@ -284,7 +287,7 @@ def main(args):
             )
         else:
             checkpoint = torch.load(args.resume, map_location="cpu")
-        model_without_ddp.load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint["model"])
         if (
             not args.eval
             and "optimizer" in checkpoint
@@ -389,14 +392,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         "DETR training and evaluation script", parents=[get_args_parser()]
     )
-    args = parser.parse_args()
-    config = OmegaConf.create(vars(args))
+    args = OmegaConf.load("config/model_config.yaml")
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         Path(os.path.join(args.output_dir, args.model_name)).mkdir(
             parents=True, exist_ok=True
         )
         OmegaConf.save(
-            config, os.path.join(args.output_dir, args.model_name, "config.yaml")
+            args, os.path.join(args.output_dir, args.model_name, "config.yaml")
         )
     main(args)
